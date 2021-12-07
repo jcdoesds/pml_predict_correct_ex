@@ -1,0 +1,332 @@
+---
+title: "Predicting Correct Exercise"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, message = FALSE}
+library(tidyverse)
+library(caret)
+library(rattle)
+library(C50)
+library(randomForest)
+
+seed <- 202112
+```
+
+
+## Summary
+In this project, we use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants to predict the manner in which they did the exercise: correctly, or with one of four kinds of mistakes.
+
+Using 4 different machine learning algorithms, we predict what class of error, or if the exercise is correct, given only a combination of values of the accelerometers. 
+
+With the model, we are able to predict over 99% of the validating set correctly. We choose to implement the best model for the test case.
+
+## Introduction
+This is the final report for Coursera’s Practical Machine Learning course, as part of the Data Science Specialization track offered by John Hopkins.
+
+In this project, we use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants to predict the manner in which they did the exercise. This is the “classe” variable in the training set. We train 4 models: Classification and Response Tree, C5.0 model, Stochastic Gradient Boosting, and Random Forest on the training data. 
+
+We then predict using a validation set to examine performance. Based on the validation performance, we decide on the best model, and use it to predict 20 cases using the test csv set.
+
+## Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+In this project, we use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the [website](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har) -see the section on the Weight Lifting Exercise Dataset.
+
+```{r loaddata, cache = TRUE}
+#The training data for this project are available here: 
+train_path <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+#The test data are available here:
+test_path <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+traindf <- read.csv(train_path)
+testdf <- read.csv(test_path)
+```
+
+## Data
+
+Per the dataset source, and important for our understanding : 
+> "Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). 
+Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes. "
+
+```{r echo=TRUE, results='hide'}
+dim(traindf)
+glimpse(traindf)
+# output omitted, very long
+```
+
+Since our observations (`r nrow(traindf)` in the training set) are for several different sensors: belt, arm, forearm, and the dumbbell, for 6 people for several repetitions, each observation is not really the same thing. The observations are from rolling windows of short, overlapping time periods. I could not find clear meta data describing each column of data. One thing is clear, summary variables, like kurtosis, skewness, and max/min are only provided when `new_window` is "yes". 
+
+Let's take a look at the data for a single individual and one measure that is not a summary measure: 
+```{r, fig.width = 8, fig.height = 6}
+ggplot(filter(traindf, user_name=="carlitos"), aes(x=raw_timestamp_part_2, 
+                              y = yaw_dumbbell,
+                              color=classe)) +
+  geom_point(alpha = .3) +
+  facet_wrap(num_window ~ .) + 
+  theme_void() 
+```
+
+This shows that within any numbered window, the data appear to be continuous on a time series. 
+
+It may be tempting to train a model for each person, to extract the person specific information, but the data are not intended to only improve a specific person's performance. Rather, the data are intended to: given a particular set of readings, predict whether the exercise is being performed correctly, or, if not, identify the error.
+
+This means that we want to be naive of the person and window of performance and time. However, if we were not going to be predicting (our test data) on single observations, it may be worth exploring a model on the change from one observation to the next rather than the observation at a moment in time. We are not doing that due to the bounds of this class exercise.
+
+For data cleaning, I remove the summary observations and any variables that are missing, character, or NA for a majority of observations. This allows us to focus on the accelerometer readings. 
+
+```{r cache = TRUE}
+library(naniar)
+na_strings = c('NA','#DIV/0!','',' ')
+fna <- function(x)  Filter(function(y) !all(is.na(y)), x) # remove all na
+
+traindf_new_no <- traindf %>%
+  filter(new_window == "no") %>% 
+  naniar::replace_with_na_all(condition = ~.x %in% na_strings) 
+traindf_new_no <- fna(traindf_new_no) %>%  
+  select(-1:-7)  # these are the ones at the beginning
+
+# and now split into train and validation, so can check before test
+inTrain = createDataPartition(traindf_new_no$classe, p = 0.7)[[1]]
+training = traindf_new_no[ inTrain,]
+validating = traindf_new_no[-inTrain,]
+```
+
+Now, we have `r scales::comma(nrow(training), digits=0)` observations and `r scales::comma(nrow(validating), digits = 0)` validating observations of `r ncol(training)-1` possible predictors and one classification response, **classe**. We will focus on the training data, which include this distribution of **classe** observations: 
+
+```{r, echo = FALSE}
+table(training$classe)
+```
+
+There are so many potential predictors that the extent of plotting to examine all relationships would not fit within the parameters of this paper. Plotting the variables is helpful for understanding the data. Many exploratory plots were completed and not shown here. 
+
+```{r echo=FALSE, fig.width = 8, fig.height = 4}
+# The ideal situation for this context would be if we could represent the *classe* from the dumbbell alone - the exerciser would not have to wear any devices, and we would have a "smart" dumbbell. Playing along those lines, let's visualize the dumbbell data only.
+# 
+# training_dumbbell <- training %>%
+#   select(classe, ends_with("dumbbell"), 
+#          ends_with("dumbbell_x"), 
+#          ends_with("dumbbell_y"), 
+#          ends_with("dumbbell_z")) %>%
+#   pivot_longer(-classe)
+# ggplot(training_dumbbell, aes(x=as.numeric(row.names(training_dumbbell)), 
+#                               y = value,
+#                               color=as.factor(classe))) +
+#   geom_point(show.legend=FALSE) +
+#   labs(x="rowindex", y="", x="", title="Dumbell Variables colored by Classe") +
+#   facet_wrap(name ~ .,scales="free") +
+#   theme(axis.text.x = element_blank())
+
+#Or, maybe we want to market a belt. Along those lines, let's visualize the belt data only.
+# training_belt <- training %>%
+#   select(classe, ends_with("belt"), 
+#          ends_with("belt_x"), 
+#          ends_with("belt_y"), 
+#          ends_with("belt_z")) %>%
+#   pivot_longer(-classe)
+# ggplot(training_belt, aes(x=as.numeric(row.names(training_belt)), 
+#                               y = value,
+#                               color=as.factor(classe))) +
+#   geom_point(show.legend=FALSE) +
+#   labs(x="rowindex", y="", x="", title="Belt Variables colored by Classe") +
+#   facet_wrap(name ~ .,scales="free") +
+#   theme(axis.text.x = element_blank())
+
+```
+
+```{r fig.width = 8, fig.height = 8}
+pdf <- training %>%
+  pivot_longer(-classe)
+ggplot(pdf, aes(x=as.numeric(row.names(pdf)), 
+                              y = value,
+                              color=as.factor(classe))) +
+  geom_point(show.legend=FALSE) +
+  labs(x="rowindex", y="", x="", title="Variables colored by Classe") +
+  facet_wrap(name ~ .,scales="free") +
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank())
+```
+
+From this visualization, it appears that there is one observation with values very far from the rest across several gyros variables. There is also one observation with the `magnet_dumbbell_y` variable completely outside the bounds. I am remove both of these observations from the training set.
+
+```{r}
+training <- training %>% 
+  filter(gyros_dumbbell_y < 40 & magnet_dumbbell_y > -3000) # remove two observations with extreme outliers
+```
+
+
+## Model Development
+With our clean data set, we build four models. We are building more than one model because: (1) we have no subject matter expertise to base the model on (that would be ideal), and (2) different kinds of models have trade offs. We seek to get the best predictive capability out of these data. In an ideal world, it would also be interpretable. 
+
+For all models, we set the same seed, we use a train control for repeated cross-validation, and we ask each model to use the accuracy metric. I am using 10 folds with 3 repetitions. 
+
+```{r setcontrolmetric}
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+metric <- "Accuracy"
+```
+
+### Classification Tree
+A classification tree is fairly easy to interpret and may be useful for the kind of information that we are trying to convey - as in, when we see this kind of movement, we can quickly classify what kind of error is happening. With more information, a classification tree can be tuned specifically. I am mostly using the defaults. 
+
+```{r makemodct, cache = T, echo = TRUE}
+set.seed(seed)
+modct <- train(classe ~ ., method = "rpart", 
+                #tuneLength = 6,
+                metric = metric, 
+                trControl = control, 
+                data = training)
+
+```
+
+```{r}
+fancyRpartPlot(modct$finalModel, type=4)
+```
+
+This tells a very nice story. How good is the classification? We will see how well it works at the end in comparison with the other models, which I will not try to interpret.
+
+### C5.0
+
+See5/C5.0 is an adaptive tree and rule based classifier. This allows for a more robust model than a simple, naive tree like we first made. 
+
+```{r makemodc50, cache = TRUE, echo = TRUE}
+# C5.0
+set.seed(seed)
+modc50 <- train(classe ~ ., method = "C5.0", 
+                metric = metric, 
+                trControl = control, 
+                data = training)
+```
+
+### Stochastic Gradiate Boosting Machine
+
+Boosting algorithms reduce error by sequentially building trees and basing the next one on weak learners. Boosting reduces error mostly by reducing bias. Gradient Boosting Machine (GBM) is a boosting algorithm that trains many models and boosts using gradients in the loss function. 
+
+```{r makemodgbm, cache = TRUE, echo = TRUE}
+# Stochastic Gradient Boosting
+set.seed(seed)
+modgbm <- train(classe ~ ., method = "gbm", 
+                metric = metric, 
+                trControl = control,
+                data = training,
+                verbose=FALSE)
+
+```
+### Random Forest 
+
+Random Forest is another ensemble method, but it attempts to reduce error by reducing variance. 
+This is an extension of bagging that tends to yield good results even if it may be hard to interpret. For our purposes, the trade off for lack of interpretability for good prediction is fine. 
+
+```{r makemodrf, cache = TRUE, echo = TRUE}
+set.seed(seed)
+modrf <- train(as.factor(classe) ~ ., method = "rf", 
+                metric = metric, 
+                type = "Classification",
+                ntree = 50,
+                trControl = control, 
+                importance = TRUE, 
+                proximity = TRUE,
+                data = training)
+```
+
+
+#### Summary of Training Models
+
+As we might have suspected, the simple classification tree (cart) with limited tuning does not perform as well as the other approaches. C5.0 (c5.0) performs better than the random forest (rf) and the gradient boosting machine (gbm) on the training data.
+
+```{r}
+# summarize results
+boosting_results <- resamples(list(cart = modct, c5.0 = modc50, gbm = modgbm,rf = modrf))
+summary(boosting_results)
+dotplot(boosting_results)
+```
+
+This accuracy is based on the set used to train the data, though. It could suffer from overfitting. Therefore, we should check our methods against the `validating` set as well before choosing a model for test. 
+
+### Cross Validation
+
+*How do our models perform on our validation set?* To find out, we predict the `classe` for each validation observation and compare it to the actual validation classe. The random forest (RF) and C5.0 still come out on top. Their performance is similar. 
+
+```{r validation, message = FALSE}
+vct <- predict(modct,newdata=validating)
+vc50 <- predict(modc50,newdata=validating)
+vgbm <- predict(modgbm,newdata=validating)
+vrf <- predict(modrf,newdata=validating)
+vacc <- data.frame("ACTUAL" = validating$classe,
+                  "CART" = validating$classe==vct,
+                  "C5.0" = validating$classe==vc50,
+                  "GBM" = validating$classe==vgbm,
+                  "RF" = as.factor(validating$classe)==vrf)
+tot_val <- validating %>%
+  group_by(classe) %>%
+  summarise(n = n()) %>%
+  select(ACTUAL = classe, n)
+vacc_sum <- vacc %>%
+  group_by(ACTUAL) %>%
+  summarise_all(sum) %>%
+  pivot_longer(-ACTUAL) %>%
+  left_join(tot_val) %>%
+  mutate(value = value/n)
+vs <- vacc_sum %>% select(-ACTUAL, -n) %>% group_by(name) %>% summarise_all(mean) %>% arrange(desc(value))
+best <- vs$name[1]
+```
+
+```{r}
+vs
+```
+
+```{r plotrfval, fig.width = 4, fig.height = 3}
+ggplot(vacc_sum, aes(x=name, y=value, fill = ACTUAL)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Percent of Validating Set Correct", x = "Model", y = "") +
+  theme_minimal()
+```
+
+
+### Conclusion 
+While the random forest and c5.0 model worked very well on our training set and our validation set, there is room for improvement, especially in identifying *classe C* and *classe D*. The `r best` model performed *slightly better* on average across classe types on the validation data, so that is the model that I am using for test. 
+
+If we were going to make recommendations to real humans with these data, we would want to be able to make sure that we have a better fit. Given that this model is based off of only 6 people, who are all males within about the same age range, we likely are not observing the full range of our predictors. More observations across people could improve this model. 
+
+There could be real harm to people if we told them they were doing the move wrong when they were doing it correctly, as they could adjust and hurt themselves. 
+
+## Predictions on Test Cases
+
+There is no way to confirm until after submission if these are correct; however, here are the 
+predictions that I get using the C5.0 method and the RF (Random Forest). Both are shown here to allow me to see if they predict the same for curiosity. 
+
+```{r}
+# first clean up the test set to have the same vars as training
+# testdf
+testdf_new_no <- testdf %>%
+  filter(new_window == "no") %>% 
+  naniar::replace_with_na_all(condition = ~.x %in% na_strings) 
+testing <- fna(testdf_new_no) %>%  
+  select(-1:-7)  # these are the ones at the beginning
+testfitrf <- predict(modrf,newdata=testing)
+testfitc50 <- predict(modc50,newdata=testing)
+```
+
+### Random Forest
+
+```{r}
+testfitrf
+```
+
+### C5.0 
+
+```{r}
+testfitc50
+```
+
+
+## Session Info
+This analysis was completed on this setup.
+```{r}
+sessionInfo()
+```
+
